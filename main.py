@@ -3,11 +3,11 @@ import logging
 import signal
 import threading
 import time
-import typing
 
 import pynput
 
 logging.basicConfig(level=logging.INFO)
+
 
 class EventProducer:
     def __init__(self,
@@ -38,7 +38,7 @@ class Timer(EventProducer, threading.Thread):
         self._logger = logging.getLogger('Timer')
 
     def run(self) -> None:
-        self._logger.info('Start %s. Duration: %s',
+        self._logger.debug('Start %s. Duration: %s',
                           self.native_id, self.planned_duration)
         self._start_time = time.time()
 
@@ -53,7 +53,7 @@ class Timer(EventProducer, threading.Thread):
 
     def stop(self) -> float:
         self._running = False
-        self._logger.info('Stop %s. Fact Duration %s',
+        self._logger.debug('Stop %s. Fact Duration %s',
                           self.native_id, self.duration)
         return self.duration
 
@@ -133,18 +133,23 @@ class App(threading.Thread):
         self._stage = Stage.stop()
         self._schedule_iter = it.cycle(self.schedule)
         self._stats = stats
-        self._timer = None
+        self._stage_timer = None
         self._event_cond = threading.Condition()
         self._timer_event = threading.Event()
         self._moving_event = threading.Event()
-        
+        self._unmoving_event = threading.Event()
+        self._unmoving_timer = None
         self._logger = logging.getLogger('App')
 
     def run(self):
-        self._start_timer(next(self._schedule_iter))
+        self.next_stage()
 
         def has_event():
-            return self._timer_event.is_set() or self._moving_event.is_set()
+            return (
+                    self._timer_event.is_set()
+                    or self._moving_event.is_set()
+                    or self._unmoving_event.is_set()
+            )
 
         while self._running:
             with self._event_cond:
@@ -157,39 +162,68 @@ class App(threading.Thread):
                 if self._timer_event.is_set():
                     self._timer_event.clear()
                     self._handle_alarm()
+
+                if self._unmoving_event.is_set():
+                    self._unmoving_event.clear()
+                    self._handle_unmoving_alarm()
                 
     def _handle_movement(self):
         if self._stage.name == Stage.RELAX:
-            self._logger.info('Movement in RELAX stage')
+            self._logger.debug('Movement in RELAX stage')
             self.next_stage()
-            # TODO: after moving to next stage (WORK) the main thread stopped
         elif self._stage.name == Stage.WORK:
-            self._logger.info('Movement in WORK stage')
+            self._logger.debug('Movement in WORK stage')
+            self._stop_unmoving_timer()
+            self._start_unmoving_timer()
 
     def _handle_alarm(self):
-        # TODO: if in relax stage wait for movements
-        #       if in work stage wait until movements stop
         self.next_stage()
-        
+
+    def _handle_unmoving_alarm(self):
+        if self._stage.name == Stage.WORK:
+            self._logger.debug('Unmovement in WORK stage')
+            self.next_stage()
+
     def next_stage(self):
-        self._stop_timer()
-        self._start_timer(next(self._schedule_iter))
+        self._stop_stage_timer()
+        stage = next(self._schedule_iter)
+        self._start_stage_timer(stage)
+        if stage.name == Stage.WORK:
+            self._stop_unmoving_timer()
+            self._start_unmoving_timer()
 
-    def _stop_timer(self):
-        if self._timer:
-            fact_duration = self._timer.stop()
+    def _stop_stage_timer(self):
+        if self._stage_timer:
+            fact_duration = self._stage_timer.stop()
             self._stats.event(self._stage, fact_duration)
+            self._logger.debug('Timer stopped: %s sec', fact_duration)
 
-    def _start_timer(self, stage: Stage):
+    def _stop_unmoving_timer(self):
+        if self._unmoving_timer:
+            self._unmoving_timer.stop()
+
+    def _start_stage_timer(self, stage: Stage):
         self._logger.info('Starting stage: %s', stage)
         self._stage = stage
-        self._timer = Timer(self._event_cond,
-                            self._timer_event,
-                            self._stage.duration)
-        self._timer.start()
+        self._stage_timer = Timer(
+            self._event_cond,
+            self._timer_event,
+            self._stage.duration)
+        self._stage_timer.start()
 
-    def stop(self) -> float:
-        self._stop_timer()
+    def _start_unmoving_timer(self):
+        seconds = 5
+        self._logger.debug('Starting unmoving timer: %s', seconds)
+        self._unmoving_timer = Timer(
+            self._event_cond,
+            self._unmoving_event,
+            seconds
+        )
+        self._unmoving_timer.start()
+
+    def stop(self):
+        self._stop_stage_timer()
+        self._stop_unmoving_timer()
         self._running = False
         self._logger.info('Stop.')
 
